@@ -79,7 +79,7 @@ services:
       - /bin/bash
       - -c
       - |
-        rpk topic create $$KAFKA_TOPIC_FLOWS $$KAFKA_TOPIC_BGP $$KAFKA_TOPIC_SNMP $$KAFKA_TOPIC_ANOMALIES $$KAFKA_TOPIC_RUNBOOKS --brokers redpanda:9092 -p 3 -r 1 &&
+        rpk topic create $$KAFKA_TOPIC_FLOWS $$KAFKA_TOPIC_BGP $$KAFKA_TOPIC_SNMP $$KAFKA_TOPIC_ANOMALIES $$KAFKA_TOPIC_RUNBOOKS --brokers redpanda:9092 -p 3 -r 1 || true &&
         echo 'All Kafka topics ready.'
     networks:
       - netobserv
@@ -273,6 +273,42 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+
+  # ── Simulator (synthetic VPC flows / BGP / SNMP telemetry) ───────────────────
+  simulator:
+    build:
+      context: ./services/simulator
+      dockerfile: Dockerfile
+    image: netobserv/simulator:local
+    container_name: netobserv-simulator
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC_FLOWS: ${KAFKA_TOPIC_FLOWS}
+      KAFKA_TOPIC_BGP: ${KAFKA_TOPIC_BGP}
+      KAFKA_TOPIC_SNMP: ${KAFKA_TOPIC_SNMP}
+      PRODUCER_RATE: ${SIMULATOR_PRODUCER_RATE:-75}
+      SCENARIO_MODE: ${SIMULATOR_SCENARIO_MODE:-scheduled}
+      SCENARIO: ${SIMULATOR_SCENARIO:-normal}
+      ANOMALY_INTERVAL_MINUTES: ${SIMULATOR_ANOMALY_INTERVAL_MINUTES:-15}
+      SNMP_INTERVAL_SECONDS: ${SIMULATOR_SNMP_INTERVAL_SECONDS:-30}
+      HEALTH_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "8090:8080"   # host:container — container 8080 is reserved for Redpanda Console on the host
+    networks:
+      - netobserv
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # ── Grafana ───────────────────────────────────────────────────────────────────

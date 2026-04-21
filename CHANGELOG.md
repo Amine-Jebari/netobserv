@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 2.1] — 2026-04-20 — Simulator Service
+
+### Added
+
+- **services/simulator/** — `netobserv_simulator` Python 3.11 package that
+  generates synthetic VPC Flow Log v2 records, BGP events, and SNMP metric
+  samples, publishing each to its own Kafka topic. Async producer built on
+  `aiokafka`, config via `pydantic-settings`, structured JSON logging via
+  `structlog`, embedded FastAPI `/health` endpoint on port 8080.
+
+- **Fixed topology for learnability** — 20 source IPs across three internal
+  subnets, 50 destinations (mix of public services, CDN ranges, upstream peers),
+  10 simulated routers with 3 interfaces each, 4 BGP peers announcing 6 prefixes.
+  Traffic mix weighted: HTTPS 55%, HTTP 15%, DNS 15%, SSH 5%, BGP 4%, NTP/QUIC 6%.
+
+- **Scenario engine** — injects one of six scenarios every
+  `ANOMALY_INTERVAL_MINUTES` (default 15): `normal`, `bgp_flap`,
+  `traffic_spike`, `route_leak`, `link_saturation`, `latency_spike`. Three
+  scheduling modes: `scheduled` (round-robin), `random`, `single`. Every
+  injection is logged at WARNING with `scenario.injected` so detections can
+  be correlated with ground truth.
+
+- **services/simulator/Dockerfile** — multi-stage build, non-root user
+  `sim:10001`, minimal `python:3.11-slim` runtime, container `HEALTHCHECK`
+  polling the HTTP endpoint.
+
+- **services/simulator/tests/** — pytest suite covering schema conformance
+  for all three generators, topology constants, and the full scenario
+  scheduler (injection timing, rotation, per-scenario parameters, expiry).
+
+- **services/simulator/README.md** — full scenario reference, env-var table,
+  standalone and compose run instructions.
+
+- **terraform/kinesis.tf** — four Kinesis Data Streams mirroring the Kafka
+  topics (`network-flows`, `network-bgp`, `network-snmp`,
+  `anomalies-scored`): KMS encryption, per-stream configurable shard counts,
+  24–8760h retention variable, shard-level CloudWatch metrics, tagged with
+  `LocalTopic` for traceability back to the local stack. Outputs stream
+  ARNs and names as maps for downstream consumers.
+
+### Changed
+
+- **docker-compose.yml** — added `simulator` service (depends on
+  `redpanda` healthy and `redpanda-init` completed). Container port 8080
+  mapped to host `8090` to avoid colliding with Redpanda Console.
+
+- **.env.example / .env** — replaced legacy simulator vars
+  (`SIMULATOR_EMIT_INTERVAL_MS`, `SIMULATOR_NUM_NODES`,
+  `SIMULATOR_ANOMALY_RATE`) with the new schema (`SIMULATOR_PRODUCER_RATE`,
+  `SIMULATOR_SCENARIO_MODE`, `SIMULATOR_SCENARIO`,
+  `SIMULATOR_ANOMALY_INTERVAL_MINUTES`, `SIMULATOR_SNMP_INTERVAL_SECONDS`).
+
+---
+
 ## [Phase 2] — 2026-04-19 — Local Infrastructure Stack
 
 ### Added
