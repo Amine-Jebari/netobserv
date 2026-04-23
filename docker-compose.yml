@@ -75,11 +75,12 @@ services:
       KAFKA_TOPIC_SNMP: ${KAFKA_TOPIC_SNMP}
       KAFKA_TOPIC_ANOMALIES: ${KAFKA_TOPIC_ANOMALIES}
       KAFKA_TOPIC_RUNBOOKS: ${KAFKA_TOPIC_RUNBOOKS}
+      KAFKA_TOPIC_TOPOLOGY_UPDATES: ${KAFKA_TOPIC_TOPOLOGY_UPDATES}
     entrypoint:
       - /bin/bash
       - -c
       - |
-        rpk topic create $$KAFKA_TOPIC_FLOWS $$KAFKA_TOPIC_BGP $$KAFKA_TOPIC_SNMP $$KAFKA_TOPIC_ANOMALIES $$KAFKA_TOPIC_RUNBOOKS --brokers redpanda:9092 -p 3 -r 1 || true &&
+        rpk topic create $$KAFKA_TOPIC_FLOWS $$KAFKA_TOPIC_BGP $$KAFKA_TOPIC_SNMP $$KAFKA_TOPIC_ANOMALIES $$KAFKA_TOPIC_RUNBOOKS $$KAFKA_TOPIC_TOPOLOGY_UPDATES --brokers redpanda:9092 -p 3 -r 1 || true &&
         echo 'All Kafka topics ready.'
     networks:
       - netobserv
@@ -309,6 +310,60 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    restart: unless-stopped
+
+  # ── Collector (Kafka → InfluxDB / OpenSearch / MinIO fan-out) ────────────────
+  collector:
+    build:
+      context: ./services/collector
+      dockerfile: Dockerfile
+    image: netobserv/collector:local
+    container_name: netobserv-collector
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC_FLOWS: ${KAFKA_TOPIC_FLOWS}
+      KAFKA_TOPIC_BGP: ${KAFKA_TOPIC_BGP}
+      KAFKA_TOPIC_SNMP: ${KAFKA_TOPIC_SNMP}
+      KAFKA_TOPIC_TOPOLOGY_UPDATES: ${KAFKA_TOPIC_TOPOLOGY_UPDATES}
+      KAFKA_CONSUMER_GROUP_PREFIX: ${KAFKA_COLLECTOR_GROUP_PREFIX:-netobserv-collector}
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-latest}
+      INFLUXDB_URL: ${INFLUXDB_URL}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      # Code expects OPENSEARCH_URL; repo-wide .env uses OPENSEARCH_HOST.
+      OPENSEARCH_URL: ${OPENSEARCH_HOST}
+      DYNAMODB_ENDPOINT: ${DYNAMODB_ENDPOINT_URL}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      S3_ENDPOINT: ${S3_ENDPOINT_URL}
+      S3_BUCKET: ${S3_BUCKET_ARCHIVE}
+      S3_REGION: ${S3_REGION}
+      HTTP_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "8091:8080"   # host:container — container 8080; host 8091 keeps 8080/8090 free
+    networks:
+      - netobserv
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      influxdb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   # ── Grafana ───────────────────────────────────────────────────────────────────

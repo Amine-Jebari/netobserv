@@ -5,6 +5,71 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 2.2] — 2026-04-21 — Collector Service
+
+### Added
+
+- **services/collector/** — `netobserv_collector` Python 3.11 package that
+  consumes `network.flows`, `network.bgp`, and `network.snmp` on **three
+  independent Kafka consumer groups** (prefix `netobserv-collector-*`) and
+  fans each message out to the destinations appropriate for its shape:
+
+  - **Flows** → InfluxDB (`measurement=flows`, tags=srcaddr+dstaddr+protocol,
+    fields=packets+bytes) **and** OpenSearch (`flows-YYYY.MM.DD`) **and**
+    MinIO/S3 (`flows/YYYY/MM/DD/HH/<uuid>.json`).
+  - **BGP events** → OpenSearch (`bgp-events-YYYY.MM.DD`) **and** republished
+    to the `topology.updates` Kafka topic for the topology service.
+  - **SNMP samples** → InfluxDB (`measurement=snmp`, tags=device_id+interface+metric,
+    fields=value).
+
+- **Batching** — InfluxDB line-protocol 500-point batches; OpenSearch `_bulk`
+  100-doc batches; MinIO/S3 1-minute NDJSON chunks. Each destination runs on
+  its own `asyncio.Task` so a failing sink never blocks writes to any other
+  sink.
+
+- **HTTP endpoints** — `GET /health` (200 iff every client is connected),
+  `GET /metrics` (Prometheus text exposition: `collector_messages_consumed_total`,
+  `collector_messages_written_total`, `collector_errors_total`,
+  `collector_lag_seconds`), `GET /stats` (JSON per-topic throughput).
+
+- **Environment-agnostic S3/MinIO** — blank `S3_ENDPOINT` targets real AWS
+  S3; a populated endpoint targets MinIO. Same code path in both envs.
+
+- **services/collector/Dockerfile** — multi-stage `python:3.11-slim` build,
+  non-root `collector:10001` user, container `HEALTHCHECK` polling `/health`.
+
+- **services/collector/tests/** — pytest suite with mocked clients covering
+  each fan-out handler (flows, bgp, snmp), isolation under destination
+  failures, InfluxDB line-protocol escaping, and the metrics registry.
+
+- **Terraform (AWS equivalents):**
+  - `terraform/timestream.tf` — `netobserv` database with two tables
+    (`metrics`, `flows`); split memory/magnetic retention tuned per table.
+  - `terraform/opensearch.tf` — single-node `t3.small.search` domain with
+    fine-grained access control (master user in Secrets Manager), at-rest +
+    node-to-node encryption, HTTPS-only, CloudWatch application logs, and
+    optional VPC placement (`opensearch_subnet_ids`).
+  - `terraform/s3.tf` — versioned archive bucket with a random suffix,
+    public-access block, AES256 SSE, lifecycle transition to Deep Archive
+    after 30 days and expiration at 365 days (plus non-current cleanup and
+    incomplete-multipart abort).
+  - `terraform/dynamodb.tf` — `network-topology` (PK=node_id) and
+    `network-links` (PK=source_node, SK=target_node) with a
+    `target-lookup` GSI, PAY_PER_REQUEST, point-in-time recovery, SSE.
+
+### Changed
+
+- **docker-compose.yml** — added `collector` service (depends on `redpanda`,
+  `influxdb`, `opensearch`, and `minio` healthy + the init one-shots
+  completed). Container port 8080 mapped to host `8091`. Added
+  `topology.updates` to the topics provisioned by `redpanda-init`.
+
+- **.env.example** — added `KAFKA_TOPIC_TOPOLOGY_UPDATES=topology.updates`,
+  `KAFKA_COLLECTOR_GROUP_PREFIX`, and a new `## Collector` section with
+  tuning knobs for batch sizes and archive flush interval.
+
+---
+
 ## [Phase 2.1] — 2026-04-20 — Simulator Service
 
 ### Added
