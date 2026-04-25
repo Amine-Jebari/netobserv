@@ -5,6 +5,82 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 2.3] — 2026-04-23 — Topology Service
+
+### Added
+
+- **services/topology/** — `netobserv_topology` Python 3.11 package that owns
+  the live network-graph view of the platform:
+  - Consumes three Kafka topics on independent consumer groups
+    (`netobserv-topology-bgp` / `-flows` / `-snmp`):
+    - `topology.updates` → BGP ANNOUNCE/UPDATE upserts peer nodes and
+      `bgp_peer` edges (source=`local-gateway`); WITHDRAW marks the edge
+      inactive (kept for historical visibility rather than deleted).
+    - `network.flows` → increments `traffic_bytes`/`traffic_packets` counters
+      and updates an EWMA-smoothed `utilization` value on the edge between
+      the subnets/routers owning srcaddr and dstaddr.
+    - `network.snmp` → updates a node's `health_status` (OK/WARN/CRITICAL)
+      and `last_seen` based on per-metric thresholds (`cpuLoad`,
+      `latencyMs`, `ifUtilizationPct`, interface error counters).
+  - Persists everything to DynamoDB (`network-topology` nodes,
+    `network-links` edges) via `aioboto3`; re-hydrates an in-memory
+    `networkx.DiGraph` on startup by scanning both tables and re-hydrates
+    periodically (`TOPOLOGY_REFRESH_INTERVAL`, default 300 s) to self-heal
+    from dropped Kafka messages.
+
+- **FastAPI surface** — `GET /health` (200 iff DynamoDB + every consumer is
+  connected), `GET /metrics` (Prometheus text exposition with
+  `topology_messages_consumed_total`, `topology_messages_applied_total`,
+  `topology_errors_total`, `topology_graph_nodes`, `topology_graph_edges`,
+  `topology_ws_clients`, `topology_lag_seconds`), `GET /stats` (JSON
+  per-topic throughput), and the query endpoints called by the agent and
+  frontend:
+  - `GET /topology` — full graph as `{nodes, edges}`.
+  - `GET /topology/node/{node_id}` — node details + inbound / outbound edges.
+  - `GET /topology/path?src=<ip>&dst=<ip>` — shortest path (maps IPs → nodes
+    via explicit `metadata.ips` matches or subnet CIDR containment, then
+    `networkx.shortest_path`).
+  - `GET /topology/affected?prefix=<cidr>` — nodes and edges whose stored
+    prefix matches or overlaps the query CIDR, plus aggregated AS-path impact.
+  - `GET /topology/subgraph?node_id=<id>&depth=<n>` — BFS subgraph up to
+    10 hops (used to build agent context without dragging in the whole graph).
+  - `WebSocket /ws/topology` — sends an initial `snapshot` payload on
+    connect, then streams per-mutation diffs (`link_announced`,
+    `link_withdrawn`, `traffic_delta`, `node_health`) to the React dashboard.
+
+- **services/topology/Dockerfile** — multi-stage `python:3.11-slim` build,
+  non-root `topology:10002` user, container `HEALTHCHECK` polling `/health`.
+
+- **services/topology/tests/** — pytest suite (graph invariants, path/
+  affected/subgraph queries, handler behaviour for ANNOUNCE/WITHDRAW/
+  traffic/health, HTTP + WebSocket smoke via `TestClient`) with an
+  in-memory `FakeStore` that mirrors the DynamoDB write surface.
+
+- **scripts/init_topology.py** — one-shot, idempotent seeder. Creates both
+  DynamoDB tables (with the `node-type-lookup` GSI on nodes and
+  `target-lookup` GSI on links) if absent, then writes a realistic starting
+  topology: 4 VPCs across 3 regions, 10 subnets, 3 transit gateways in a
+  full mesh, 1 local BGP speaker peering with 4 external ASNs. Gives the
+  `/topology` endpoint something to render before any Kafka events arrive.
+
+### Changed
+
+- **docker-compose.yml** — added `topology` service. Depends on `redpanda`,
+  `redpanda-init`, and `dynamodb-local` healthy. Container port 8080
+  published on host `8092` (keeps 8080/8090/8091 free).
+
+- **terraform/dynamodb.tf** — added a `node-type-lookup` GSI to the
+  `network-topology` table (hash_key=`node_type`, projection=ALL) so agent
+  queries can filter nodes by type without a full scan. `AttributeDefinitions`
+  now includes `node_type`.
+
+- **.env.example** — added `DYNAMODB_TABLE_LINKS`, a new `## Topology`
+  section (`KAFKA_TOPOLOGY_GROUP_PREFIX`, `TOPOLOGY_REFRESH_INTERVAL`,
+  `TRAFFIC_EWMA_ALPHA`), and corrected `DYNAMODB_TABLE_TOPOLOGY` default
+  to the canonical `network-topology` used by the Terraform files.
+
+---
+
 ## [Phase 2.2] — 2026-04-21 — Collector Service
 
 ### Added

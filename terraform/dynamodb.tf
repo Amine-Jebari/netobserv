@@ -39,6 +39,24 @@ resource "aws_dynamodb_table" "network_topology" {
     type = "S"
   }
 
+  # GSI attribute used by the node-type-lookup index below. Declared here (not
+  # inside the GSI block) because DynamoDB requires every indexed attribute to
+  # be in the table's AttributeDefinitions.
+  attribute {
+    name = "node_type"
+    type = "S"
+  }
+
+  # Filter-by-type reads ("all routers", "all VPCs") hit this index instead of
+  # scanning the whole table. Projection=ALL keeps node metadata inline so the
+  # topology service can hydrate straight from the index without a follow-up
+  # GetItem per node.
+  global_secondary_index {
+    name            = "node-type-lookup"
+    hash_key        = "node_type"
+    projection_type = "ALL"
+  }
+
   point_in_time_recovery {
     enabled = true
   }
