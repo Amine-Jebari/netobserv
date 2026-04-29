@@ -5,6 +5,109 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 3.1] — 2026-04-27 — Baseline Anomaly-Detection Trainer
+
+### Added
+
+- **services/anomaly/baseline.py** — one-shot training pipeline. Pulls the
+  last `LOOKBACK_HOURS` of telemetry (flows + SNMP from InfluxDB, BGP events
+  from OpenSearch), engineers per-minute features, fits three PyOD models on
+  separate feature subsets, cross-validates each on a held-out slice plus
+  injected synthetic outliers, bundles everything into a single `.tar.gz`,
+  and uploads to MinIO/S3.
+
+  - **Isolation Forest** on traffic-volume features (total bytes/packets,
+    flow count, src/dst diversity, top-pair byte concentration, mean packet
+    size, plus diurnal sine/cosine encodings of hour-of-day and day-of-week).
+  - **Local Outlier Factor** (`novelty=True`) on per-minute BGP event
+    frequency features (announce/withdraw/update counts, unique
+    prefixes/peers, AS-path length mean/std, diurnal features).
+  - **Minimum Covariance Determinant** (PyOD MCD — robust Mahalanobis) on
+    per-minute SNMP aggregates (cpuLoad mean/max, latency mean/p95, interface
+    utilization mean/max, error counter sums, diurnal features).
+
+  Cross-validation is unsupervised: held-out real rows (label 0) are scored
+  against synthesized ±5–8σ outliers (label 1) and the resulting
+  `roc_auc_score` plus observed contamination quantiles are printed and
+  recorded in the bundle metadata.
+
+- **services/anomaly/features.py** — single source of truth for feature
+  engineering. Exposes `make_traffic_features`, `make_bgp_features`,
+  `make_snmp_features`, `add_diurnal`, and the canonical column-order
+  constants (`TRAFFIC_FEATURES`, `BGP_FEATURES`, `SNMP_FEATURES`). Phase 3.2
+  imports from this module so training and inference compute features
+  identically. Pure-pandas, deterministic, no I/O.
+
+- **services/anomaly/model_store.py** — joblib serialization, tarball
+  bundling, S3/MinIO upload and `baseline-latest.tar.gz` alias maintenance.
+  The bundle layout (`<name>.joblib` files + `metadata.json`) is the public
+  contract Phase 3.2 will load.
+
+- **services/anomaly/influx_query.py / opensearch_query.py** — synchronous
+  Flux + OpenSearch query helpers. The OpenSearch helper degrades gracefully
+  to an empty DataFrame on connection failure so a flaky search index never
+  blocks the rest of the bundle.
+
+- **services/anomaly/config.py / logging_setup.py** — `pydantic-settings`
+  schema (with multi-source aliases for S3/AWS env vars) and structlog JSON
+  logging configuration. Same patterns as collector and topology.
+
+- **services/anomaly/Dockerfile** — multi-stage `python:3.11-slim` build,
+  non-root `anomaly:10003` user, recreates the `services/anomaly/` package
+  layout inside `/app` so the runtime entry point is exactly the same as the
+  local dev command (`python -m services.anomaly.baseline`).
+
+- **services/anomaly/tests/** — pytest suite covering deterministic
+  feature-engineering output (same input → byte-identical DataFrame),
+  aggregation correctness (top-pair share, AS-path mean/std, SNMP p95,
+  missing-metric → zero), unit-circle invariance of diurnal encodings, and
+  bundle round-trip (serialize → load gives equivalent models + metadata,
+  including numpy / datetime values via the custom JSON encoder).
+
+- **services/anomaly/README.md** — full module map, env-var reference,
+  bundle format spec, canonical column order per model, and explanation of
+  the unsupervised cross-validation methodology. The "Feature spaces"
+  section is the contract Phase 3.2 binds against.
+
+- **services/__init__.py / services/anomaly/__init__.py** — empty package
+  markers so `python -m services.anomaly.baseline` resolves the
+  `from .features import ...` style relative imports from the repo root.
+
+- **terraform/sagemaker.tf** — AWS counterpart hosting the trained bundle as
+  a SageMaker Serverless Inference endpoint:
+  - `aws_iam_role` for SageMaker execution with S3 read access scoped to the
+    archive bucket (`s3:GetObject`, `s3:ListBucket` on
+    `aws_s3_bucket.archive`), plus CloudWatch Logs and ECR read-only managed
+    policies.
+  - `aws_sagemaker_model` pointing at a placeholder ECR image URI (Phase 3.3
+    will containerize the inference handler) and the
+    `models/baseline-latest.tar.gz` artifact key the trainer maintains.
+  - `aws_sagemaker_endpoint_configuration` with a `serverless_config` block
+    (memory + max-concurrency variables) — pay-per-request, scales to zero
+    between demos.
+  - `aws_sagemaker_endpoint` plus outputs for endpoint name/ARN, role ARN,
+    and the S3 model URI.
+  - Gated by `var.sagemaker_enabled` (default `false`) so `terraform plan`
+    can run before the inference image exists.
+
+### Changed
+
+- **docker-compose.yml** — added the `baseline` service under the
+  `training` profile. Excluded from the default `docker compose up`; invoked
+  with `docker compose --profile training up baseline`. Depends on
+  `influxdb`, `opensearch`, `minio` healthy and `minio-init` complete; uses
+  the same env-var conventions as the collector for S3/MinIO selection.
+
+- **.env.example** — added a Phase 3.1 block under `## Anomaly Detection`:
+  `ANOMALY_LOOKBACK_HOURS`, `ANOMALY_BGP_INDEX_PATTERN`,
+  `ANOMALY_MODEL_PREFIX`, `ANOMALY_CONTAMINATION_TRAFFIC`,
+  `ANOMALY_CONTAMINATION_BGP`, `ANOMALY_CONTAMINATION_SNMP`,
+  `ANOMALY_MIN_TRAINING_MINUTES`, `ANOMALY_RANDOM_SEED`. The Phase 3.2 vars
+  (`ANOMALY_WINDOW_SECONDS`, `ANOMALY_SCORE_THRESHOLD`, etc.) are kept
+  in place under the same heading.
+
+---
+
 ## [Phase 2.3] — 2026-04-23 — Topology Service
 
 ### Added

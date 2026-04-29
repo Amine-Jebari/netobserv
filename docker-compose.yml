@@ -413,6 +413,52 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # ── Baseline trainer (one-shot, profile=training) ────────────────────────────
+  # Pulls the last LOOKBACK_HOURS of telemetry, trains three PyOD models, and
+  # uploads the bundle to MinIO. Excluded from `docker compose up` by default —
+  # invoke with: docker compose --profile training up baseline
+  baseline:
+    profiles: ["training"]
+    build:
+      context: ./services/anomaly
+      dockerfile: Dockerfile
+    image: netobserv/anomaly-baseline:local
+    container_name: netobserv-baseline
+    environment:
+      INFLUXDB_URL: ${INFLUXDB_URL}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      OPENSEARCH_URL: ${OPENSEARCH_HOST}
+      OPENSEARCH_USER: ${OPENSEARCH_USER:-}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-}
+      OPENSEARCH_BGP_INDEX_PATTERN: ${ANOMALY_BGP_INDEX_PATTERN:-bgp-events-*}
+      S3_ENDPOINT: ${S3_ENDPOINT_URL}
+      S3_BUCKET: ${S3_BUCKET_ARCHIVE}
+      S3_REGION: ${S3_REGION}
+      S3_MODEL_PREFIX: ${ANOMALY_MODEL_PREFIX:-models}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      LOOKBACK_HOURS: ${ANOMALY_LOOKBACK_HOURS:-24}
+      CONTAMINATION_TRAFFIC: ${ANOMALY_CONTAMINATION_TRAFFIC:-0.05}
+      CONTAMINATION_BGP: ${ANOMALY_CONTAMINATION_BGP:-0.05}
+      CONTAMINATION_SNMP: ${ANOMALY_CONTAMINATION_SNMP:-0.05}
+      MIN_TRAINING_MINUTES: ${ANOMALY_MIN_TRAINING_MINUTES:-30}
+      RANDOM_SEED: ${ANOMALY_RANDOM_SEED:-42}
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - netobserv
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: "no"
+
   # ── Grafana ───────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.2

@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Terraform variable overrides — copy to terraform.tfvars and fill in real
+#  values before running tf-apply.  All variables below have safe defaults;
+#  this file exists so `make tf-plan` has a -var-file to load.
+#
+#  Local stack: no changes needed here — everything stays at defaults.
+#  AWS deployment: set aws_region and review every default before applying.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+aws_region   = "us-east-1"
+project_name = "netobserv"
+environment  = "production"
+vpc_cidr     = "10.0.0.0/16"
+
+# ── Kinesis ───────────────────────────────────────────────────────────────────
+kinesis_shard_count_flows     = 4
+kinesis_shard_count_bgp       = 1
+kinesis_shard_count_snmp      = 2
+kinesis_shard_count_anomalies = 1
+kinesis_retention_hours       = 48
+
+# ── DynamoDB ─────────────────────────────────────────────────────────────────
+dynamodb_topology_table_name = "network-topology"
+dynamodb_links_table_name    = "network-links"
+
+# ── S3 ────────────────────────────────────────────────────────────────────────
+s3_archive_bucket_name    = "netobserv-archive"
+s3_glacier_transition_days = 30
+s3_expiration_days         = 365
+
+# ── Timestream ────────────────────────────────────────────────────────────────
+timestream_db_name               = "netobserv"
+timestream_metrics_memory_hours  = 24
+timestream_metrics_magnetic_days = 90
+
+# ── OpenSearch ────────────────────────────────────────────────────────────────
+opensearch_domain_name    = "netobserv-search"
+opensearch_engine_version = "OpenSearch_2.13"
+opensearch_instance_type  = "t3.small.search"
+opensearch_instance_count = 1
+opensearch_volume_gb      = 50
+opensearch_master_username = "netobserv-admin"
+# opensearch_subnet_ids          = []   # fill in for VPC placement
+# opensearch_security_group_ids  = []
+
+# ── SageMaker ────────────────────────────────────────────────────────────────
+sagemaker_enabled                    = false   # set true once Phase 3.3 builds the ECR image
+sagemaker_model_image_uri            = "placeholder.dkr.ecr.us-east-1.amazonaws.com/netobserv-anomaly:latest"
+sagemaker_model_artifact_key         = "models/baseline-latest.tar.gz"
+sagemaker_serverless_memory_mb       = 2048
+sagemaker_serverless_max_concurrency = 5
