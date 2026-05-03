@@ -5,9 +5,13 @@
 #  scoring engine. On AWS, we host the same bundle behind a SageMaker Serverless
 #  Inference endpoint to avoid paying for an always-on instance during demos.
 #
-#  The model image URI is a placeholder — Phase 3.3 will containerize the
-#  inference handler (Flask/FastAPI on top of the PyOD bundle), push it to ECR,
-#  and replace ``var.sagemaker_model_image_uri`` with the real reference.
+#  As of Phase 3.2 the inference container is the same image that runs the
+#  local engine (services/anomaly/Dockerfile). The image is published to ECR
+#  under ``${ecr_repository_name}:${ecr_image_tag}``; SageMaker pulls it via
+#  the assume-role policy declared below. The trainer's bundle layout
+#  (``baseline-latest.tar.gz`` containing one .joblib per model + metadata.json)
+#  is what the engine module already knows how to load, so no separate
+#  inference handler is needed.
 #
 #  Model artifacts (the .tar.gz produced by services/anomaly/baseline.py) are
 #  read from the S3 archive bucket created in s3.tf.
@@ -19,10 +23,22 @@ variable "sagemaker_enabled" {
   default     = false
 }
 
-variable "sagemaker_model_image_uri" {
-  description = "ECR image URI for the inference container. Placeholder until Phase 3.3 builds the real image."
+variable "ecr_repository_name" {
+  description = "ECR repository hosting the netobserv-anomaly engine image. Created out-of-band (Phase 5 packaging)."
   type        = string
-  default     = "placeholder.dkr.ecr.us-east-1.amazonaws.com/netobserv-anomaly:latest"
+  default     = "netobserv-anomaly"
+}
+
+variable "ecr_image_tag" {
+  description = "Image tag used for the SageMaker model container. Bump on each release."
+  type        = string
+  default     = "engine-v0.2.0"
+}
+
+variable "sagemaker_model_image_uri" {
+  description = "Override-able full ECR image URI; defaults to the canonical netobserv-anomaly engine image in the deployer's account."
+  type        = string
+  default     = ""
 }
 
 variable "sagemaker_model_artifact_key" {
@@ -53,6 +69,8 @@ variable "sagemaker_serverless_max_concurrency" {
   }
 }
 
+data "aws_caller_identity" "current" {}
+
 locals {
   sagemaker_common_tags = {
     Component = "anomaly"
@@ -61,6 +79,14 @@ locals {
 
   # When sagemaker_enabled is false, count = 0 disables every resource cleanly.
   sagemaker_count = var.sagemaker_enabled ? 1 : 0
+
+  # Resolved model image URI: override → explicit value, otherwise the canonical
+  # ECR repo in the current account/region.
+  sagemaker_model_image_uri_resolved = (
+    var.sagemaker_model_image_uri != ""
+    ? var.sagemaker_model_image_uri
+    : "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.ecr_repository_name}:${var.ecr_image_tag}"
+  )
 }
 
 # ── IAM execution role ───────────────────────────────────────────────────────
@@ -126,11 +152,14 @@ resource "aws_sagemaker_model" "anomaly" {
   execution_role_arn = aws_iam_role.sagemaker_execution[0].arn
 
   primary_container {
-    image          = var.sagemaker_model_image_uri
+    image          = local.sagemaker_model_image_uri_resolved
     model_data_url = "s3://${aws_s3_bucket.archive.bucket}/${var.sagemaker_model_artifact_key}"
 
     environment = {
-      MODEL_PREFIX        = "models"
+      # The engine reads its bundle from S3 directly; SageMaker still mounts
+      # the artifact at /opt/ml/model so we expose both for compatibility.
+      MODEL_KEY           = var.sagemaker_model_artifact_key
+      S3_BUCKET           = aws_s3_bucket.archive.bucket
       BUNDLE_FORMAT       = "joblib"
       LOG_LEVEL           = "INFO"
       AWS_DEFAULT_REGION  = var.aws_region
@@ -191,4 +220,9 @@ output "sagemaker_execution_role_arn" {
 output "sagemaker_model_artifact_uri" {
   description = "S3 URI of the model bundle the endpoint loads."
   value       = "s3://${aws_s3_bucket.archive.bucket}/${var.sagemaker_model_artifact_key}"
+}
+
+output "sagemaker_model_image_uri" {
+  description = "ECR image URI hosting the inference container. Useful for sanity-checking deploys."
+  value       = local.sagemaker_model_image_uri_resolved
 }

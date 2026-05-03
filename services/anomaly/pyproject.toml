@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netobserv-anomaly"
-version = "0.1.0"
-description = "Baseline trainer + (Phase 3.2) real-time anomaly detection engine for the Network Observability Platform."
+version = "0.2.0"
+description = "Baseline trainer + real-time anomaly detection engine for the Network Observability Platform."
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26.0",
@@ -19,11 +19,15 @@ dependencies = [
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.0",
     "structlog>=24.1.0",
+    "aiokafka>=0.11.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.29.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
 ]
 
 # This package distributes only its dependency closure — the actual Python
@@ -36,6 +40,7 @@ py-modules = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 addopts = "-v --tb=short"
 # Make the repo root importable so tests can do
 # ``from services.anomaly.features import ...`` whether pytest is invoked
