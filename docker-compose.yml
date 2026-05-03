@@ -413,6 +413,114 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # ── Baseline trainer (one-shot, profile=training) ────────────────────────────
+  # Pulls the last LOOKBACK_HOURS of telemetry, trains three PyOD models, and
+  # uploads the bundle to MinIO. Excluded from `docker compose up` by default —
+  # invoke with: docker compose --profile training up baseline
+  baseline:
+    profiles: ["training"]
+    build:
+      context: ./services/anomaly
+      dockerfile: Dockerfile
+    image: netobserv/anomaly:local
+    container_name: netobserv-baseline
+    # Override the image's default entrypoint (the long-running engine) so this
+    # service runs the trainer instead.
+    entrypoint: ["python", "-m", "services.anomaly.baseline"]
+    environment:
+      INFLUXDB_URL: ${INFLUXDB_URL}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      OPENSEARCH_URL: ${OPENSEARCH_HOST}
+      OPENSEARCH_USER: ${OPENSEARCH_USER:-}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-}
+      OPENSEARCH_BGP_INDEX_PATTERN: ${ANOMALY_BGP_INDEX_PATTERN:-bgp-events-*}
+      S3_ENDPOINT: ${S3_ENDPOINT_URL}
+      S3_BUCKET: ${S3_BUCKET_ARCHIVE}
+      S3_REGION: ${S3_REGION}
+      S3_MODEL_PREFIX: ${ANOMALY_MODEL_PREFIX:-models}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      LOOKBACK_HOURS: ${ANOMALY_LOOKBACK_HOURS:-24}
+      CONTAMINATION_TRAFFIC: ${ANOMALY_CONTAMINATION_TRAFFIC:-0.05}
+      CONTAMINATION_BGP: ${ANOMALY_CONTAMINATION_BGP:-0.05}
+      CONTAMINATION_SNMP: ${ANOMALY_CONTAMINATION_SNMP:-0.05}
+      MIN_TRAINING_MINUTES: ${ANOMALY_MIN_TRAINING_MINUTES:-30}
+      RANDOM_SEED: ${ANOMALY_RANDOM_SEED:-42}
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - netobserv
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # ── Anomaly engine (real-time scorer, Phase 3.2) ─────────────────────────────
+  # Long-lived service: consumes telemetry, scores in fixed windows, emits
+  # enriched anomaly events to anomalies.scored. Blocks on startup until the
+  # baseline trainer has uploaded its first model bundle to MinIO.
+  anomaly-engine:
+    build:
+      context: ./services/anomaly
+      dockerfile: Dockerfile
+    image: netobserv/anomaly:local
+    container_name: netobserv-anomaly-engine
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC_FLOWS: ${KAFKA_TOPIC_FLOWS}
+      KAFKA_TOPIC_BGP: ${KAFKA_TOPIC_BGP}
+      KAFKA_TOPIC_SNMP: ${KAFKA_TOPIC_SNMP}
+      KAFKA_TOPIC_ANOMALIES: ${KAFKA_TOPIC_ANOMALIES}
+      KAFKA_CONSUMER_GROUP_PREFIX: ${KAFKA_ANOMALY_GROUP_PREFIX:-netobserv-anomaly}
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-latest}
+      S3_ENDPOINT: ${S3_ENDPOINT_URL}
+      S3_BUCKET: ${S3_BUCKET_ARCHIVE}
+      S3_REGION: ${S3_REGION}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      MODEL_KEY: ${ANOMALY_MODEL_KEY:-models/baseline-latest.tar.gz}
+      WINDOW_SECONDS: ${ANOMALY_WINDOW_SECONDS_RT:-10}
+      INFO_THRESHOLD: ${ANOMALY_INFO_THRESHOLD:-0.3}
+      WARN_THRESHOLD: ${ANOMALY_WARN_THRESHOLD:-0.6}
+      CRITICAL_THRESHOLD: ${ANOMALY_CRITICAL_THRESHOLD:-0.85}
+      TOPOLOGY_SERVICE_URL: ${TOPOLOGY_SERVICE_URL:-http://topology:8080}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      MODEL_WAIT_POLL_SECONDS: ${ANOMALY_MODEL_WAIT_POLL_SECONDS:-10}
+      MODEL_WAIT_MAX_SECONDS: ${ANOMALY_MODEL_WAIT_MAX_SECONDS:-0}
+      HTTP_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "8093:8080"   # host:container — keeps 8080-8092 free for other services
+    networks:
+      - netobserv
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      topology:
+        condition: service_healthy
+    healthcheck:
+      # /health returns 503 until a model bundle is loaded — the engine still
+      # starts the HTTP server during the wait, so this check is reliable.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
   # ── Grafana ───────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.2

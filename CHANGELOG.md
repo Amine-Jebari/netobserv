@@ -5,6 +5,215 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 3.2] — 2026-04-30 — Real-Time Anomaly Detection Engine
+
+### Added
+
+- **services/anomaly/engine.py** — long-lived asyncio service that consumes
+  `network.flows` / `network.bgp` / `network.snmp` from Kafka, buffers each
+  stream in fixed-duration windows (default 10 s, `WINDOW_SECONDS`), scores
+  every closed window against the three PyOD models loaded from the latest
+  bundle in MinIO/S3, and publishes enriched anomaly events to
+  `anomalies.scored`. FastAPI surface exposes `GET /health` (returns 503
+  until a model bundle is loaded), `GET /stats`, `GET /metrics` (Prometheus),
+  and `POST /reload-model` for hot reloads without a restart.
+- **services/anomaly/scorer.py** — model loader + unified scorer. Untars the
+  bundle produced by Phase 3.1, deserializes the three `.joblib` models plus
+  `metadata.json`, and turns a `WindowBatch` into zero-or-more
+  `ScoredAnomaly` records. Raw decision-function scores are normalized onto a
+  common 0-1 scale using the trainer-recorded `decision_p50`/`decision_p95`
+  quantiles (linear interpolation: p50 → 0.0, p95 → 0.5, then linearly
+  extrapolated and clamped to 1.0). Severity bands: drop below
+  `INFO_THRESHOLD` (0.3), `INFO` ∈ [0.3, 0.6), `WARN` ∈ [0.6, 0.85),
+  `CRITICAL` ≥ 0.85. Top-3 contributing features are computed per event
+  using absolute z-scores against the trainer's per-feature mean/std.
+- **services/anomaly/windowing.py** — `WindowBuffer` with one async lock and
+  a background flusher task. Empty windows are skipped; callback failures
+  are logged and the loop keeps running.
+- **services/anomaly/kafka_io.py** — small `StreamConsumer` + `JsonProducer`
+  wrappers around aiokafka, mirroring the collector's pattern.
+- **services/anomaly/topology_client.py** — async httpx client for
+  `GET /topology/affected?prefix=...`. Used to enrich BGP anomalies with the
+  set of node IDs and links impacted by an announced/withdrawn prefix.
+  Best-effort: errors are logged but do not block event publication.
+- **services/anomaly/slack_alerter.py** — direct Slack webhook poster fired
+  in-line for `CRITICAL` events (`SLACK_WEBHOOK_URL`). Provides a baseline of
+  on-call value even if the AI agent is offline. Empty webhook URL = silent
+  no-op for dev environments.
+- **services/anomaly/engine_metrics.py** — Prometheus counters/gauges/histogram:
+  `anomalies_detected_total{severity}`, `messages_consumed_total{stream}`,
+  `scoring_latency_seconds` (histogram), `model_reload_timestamp`,
+  `anomaly_engine_model_loaded`, `anomaly_engine_slack_alerts_total`. JSON
+  snapshot also exposed at `/stats`.
+- **services/anomaly/model_fetch.py** — `wait_for_bundle` polling helper
+  (`MODEL_WAIT_POLL_SECONDS` between `head_object` checks; optional
+  `MODEL_WAIT_MAX_SECONDS` deadline) and `download_bundle` for `/reload-model`.
+- **services/anomaly/tests/test_windowing.py** — covers per-stream
+  buffering, atomic drain, the background flusher cadence, callback-error
+  resilience, window-boundary timestamping, and validation of bad inputs.
+- **services/anomaly/tests/test_scoring.py** — covers severity threshold
+  bands, score normalization (below p50, at p95, extrapolation, NaN,
+  degenerate quantiles), top-feature ranking by absolute z-score, and the
+  `Scorer.score_batch` end-to-end path with stub PyOD models.
+
+### Anomaly event schema (`anomalies.scored` topic)
+
+Each published JSON record contains: `anomaly_id`, `timestamp`, `severity`,
+`score` (unified 0-1), `raw_score`, `anomaly_type` (`traffic` / `bgp` /
+`snmp`), `affected_nodes`, `affected_prefixes`, `top_features` (list of
+`{feature, value, zscore}`), `feature_vector`, `context_window_start`,
+`context_window_end`, `raw_metrics_sample` (last N raw input messages).
+
+### Changed
+
+- **services/anomaly/config.py** — `Settings` now serves both the trainer
+  and the engine. New fields: `model_key`, `kafka_*`, `window_seconds`,
+  `info_threshold` / `warn_threshold` / `critical_threshold` (with cross-
+  field validators enforcing strict ordering), `topology_service_url`,
+  `slack_webhook_url`, `http_host`/`http_port`, `model_wait_*`,
+  `raw_metrics_sample_size`.
+- **services/anomaly/Dockerfile** — installs `curl` for the engine
+  healthcheck, copies the new engine modules, switches the default
+  ENTRYPOINT from `services.anomaly.baseline` to `services.anomaly.engine`.
+  The trainer compose service overrides the entrypoint explicitly.
+- **services/anomaly/pyproject.toml** — adds `aiokafka`, `fastapi`,
+  `uvicorn`, and `pytest-asyncio`; bumps version to `0.2.0`; enables
+  `asyncio_mode = "auto"` for pytest. Image renamed to
+  `netobserv/anomaly:local` (was `netobserv/anomaly-baseline:local`).
+- **docker-compose.yml** — new `anomaly-engine` service on host port 8093,
+  depending on `redpanda`, `redpanda-init`, `minio`, `minio-init`, and
+  `topology`. The existing `baseline` service now overrides the entrypoint
+  and shares the same image.
+- **.env.example** — adds `ANOMALY_MODEL_KEY`, `ANOMALY_WINDOW_SECONDS_RT`,
+  `ANOMALY_INFO_THRESHOLD`, `ANOMALY_WARN_THRESHOLD`,
+  `ANOMALY_CRITICAL_THRESHOLD`, `ANOMALY_MODEL_WAIT_*`,
+  `KAFKA_ANOMALY_GROUP_PREFIX`, `TOPOLOGY_SERVICE_URL`, `SLACK_WEBHOOK_URL`.
+  Removes the dead Phase-1 placeholders (`ANOMALY_MODEL_PATH`,
+  `ANOMALY_RETRAIN_INTERVAL_HOURS`, `ANOMALY_SCORE_THRESHOLD`,
+  `ANOMALY_WINDOW_SECONDS`).
+
+### Terraform
+
+- **terraform/sagemaker.tf** — replaces the placeholder image URI with a
+  resolved ECR reference (`<account>.dkr.ecr.<region>.amazonaws.com/
+  netobserv-anomaly:engine-v0.2.0`, override-able). New `ecr_repository_name`
+  and `ecr_image_tag` variables. Container env now sets `MODEL_KEY` /
+  `S3_BUCKET` so the engine reads the bundle from S3 directly. New output:
+  `sagemaker_model_image_uri`.
+- **terraform/lambda.tf** — new file. Defines an async Lambda wrapper
+  (`netobserv-anomaly-scorer`) triggered by the three telemetry Kinesis
+  streams. It forwards record batches to the SageMaker endpoint and publishes
+  anomaly events to `anomalies-scored`. IAM role is least-privilege: read on
+  the three source streams, write on `anomalies-scored`,
+  `sagemaker:InvokeEndpoint` on the endpoint declared in `sagemaker.tf`, and
+  `s3:GetObject` on the deployment artifact key. Gated by
+  `lambda_enabled = false` until the deployment zip is built and uploaded.
+
+---
+
+## [Phase 3.1] — 2026-04-27 — Baseline Anomaly-Detection Trainer
+
+### Added
+
+- **services/anomaly/baseline.py** — one-shot training pipeline. Pulls the
+  last `LOOKBACK_HOURS` of telemetry (flows + SNMP from InfluxDB, BGP events
+  from OpenSearch), engineers per-minute features, fits three PyOD models on
+  separate feature subsets, cross-validates each on a held-out slice plus
+  injected synthetic outliers, bundles everything into a single `.tar.gz`,
+  and uploads to MinIO/S3.
+
+  - **Isolation Forest** on traffic-volume features (total bytes/packets,
+    flow count, src/dst diversity, top-pair byte concentration, mean packet
+    size, plus diurnal sine/cosine encodings of hour-of-day and day-of-week).
+  - **Local Outlier Factor** (`novelty=True`) on per-minute BGP event
+    frequency features (announce/withdraw/update counts, unique
+    prefixes/peers, AS-path length mean/std, diurnal features).
+  - **Minimum Covariance Determinant** (PyOD MCD — robust Mahalanobis) on
+    per-minute SNMP aggregates (cpuLoad mean/max, latency mean/p95, interface
+    utilization mean/max, error counter sums, diurnal features).
+
+  Cross-validation is unsupervised: held-out real rows (label 0) are scored
+  against synthesized ±5–8σ outliers (label 1) and the resulting
+  `roc_auc_score` plus observed contamination quantiles are printed and
+  recorded in the bundle metadata.
+
+- **services/anomaly/features.py** — single source of truth for feature
+  engineering. Exposes `make_traffic_features`, `make_bgp_features`,
+  `make_snmp_features`, `add_diurnal`, and the canonical column-order
+  constants (`TRAFFIC_FEATURES`, `BGP_FEATURES`, `SNMP_FEATURES`). Phase 3.2
+  imports from this module so training and inference compute features
+  identically. Pure-pandas, deterministic, no I/O.
+
+- **services/anomaly/model_store.py** — joblib serialization, tarball
+  bundling, S3/MinIO upload and `baseline-latest.tar.gz` alias maintenance.
+  The bundle layout (`<name>.joblib` files + `metadata.json`) is the public
+  contract Phase 3.2 will load.
+
+- **services/anomaly/influx_query.py / opensearch_query.py** — synchronous
+  Flux + OpenSearch query helpers. The OpenSearch helper degrades gracefully
+  to an empty DataFrame on connection failure so a flaky search index never
+  blocks the rest of the bundle.
+
+- **services/anomaly/config.py / logging_setup.py** — `pydantic-settings`
+  schema (with multi-source aliases for S3/AWS env vars) and structlog JSON
+  logging configuration. Same patterns as collector and topology.
+
+- **services/anomaly/Dockerfile** — multi-stage `python:3.11-slim` build,
+  non-root `anomaly:10003` user, recreates the `services/anomaly/` package
+  layout inside `/app` so the runtime entry point is exactly the same as the
+  local dev command (`python -m services.anomaly.baseline`).
+
+- **services/anomaly/tests/** — pytest suite covering deterministic
+  feature-engineering output (same input → byte-identical DataFrame),
+  aggregation correctness (top-pair share, AS-path mean/std, SNMP p95,
+  missing-metric → zero), unit-circle invariance of diurnal encodings, and
+  bundle round-trip (serialize → load gives equivalent models + metadata,
+  including numpy / datetime values via the custom JSON encoder).
+
+- **services/anomaly/README.md** — full module map, env-var reference,
+  bundle format spec, canonical column order per model, and explanation of
+  the unsupervised cross-validation methodology. The "Feature spaces"
+  section is the contract Phase 3.2 binds against.
+
+- **services/__init__.py / services/anomaly/__init__.py** — empty package
+  markers so `python -m services.anomaly.baseline` resolves the
+  `from .features import ...` style relative imports from the repo root.
+
+- **terraform/sagemaker.tf** — AWS counterpart hosting the trained bundle as
+  a SageMaker Serverless Inference endpoint:
+  - `aws_iam_role` for SageMaker execution with S3 read access scoped to the
+    archive bucket (`s3:GetObject`, `s3:ListBucket` on
+    `aws_s3_bucket.archive`), plus CloudWatch Logs and ECR read-only managed
+    policies.
+  - `aws_sagemaker_model` pointing at a placeholder ECR image URI (Phase 3.3
+    will containerize the inference handler) and the
+    `models/baseline-latest.tar.gz` artifact key the trainer maintains.
+  - `aws_sagemaker_endpoint_configuration` with a `serverless_config` block
+    (memory + max-concurrency variables) — pay-per-request, scales to zero
+    between demos.
+  - `aws_sagemaker_endpoint` plus outputs for endpoint name/ARN, role ARN,
+    and the S3 model URI.
+  - Gated by `var.sagemaker_enabled` (default `false`) so `terraform plan`
+    can run before the inference image exists.
+
+### Changed
+
+- **docker-compose.yml** — added the `baseline` service under the
+  `training` profile. Excluded from the default `docker compose up`; invoked
+  with `docker compose --profile training up baseline`. Depends on
+  `influxdb`, `opensearch`, `minio` healthy and `minio-init` complete; uses
+  the same env-var conventions as the collector for S3/MinIO selection.
+
+- **.env.example** — added a Phase 3.1 block under `## Anomaly Detection`:
+  `ANOMALY_LOOKBACK_HOURS`, `ANOMALY_BGP_INDEX_PATTERN`,
+  `ANOMALY_MODEL_PREFIX`, `ANOMALY_CONTAMINATION_TRAFFIC`,
+  `ANOMALY_CONTAMINATION_BGP`, `ANOMALY_CONTAMINATION_SNMP`,
+  `ANOMALY_MIN_TRAINING_MINUTES`, `ANOMALY_RANDOM_SEED`. The Phase 3.2 vars
+  (`ANOMALY_WINDOW_SECONDS`, `ANOMALY_SCORE_THRESHOLD`, etc.) are kept
+  in place under the same heading.
+
+---
+
 ## [Phase 2.3] — 2026-04-23 — Topology Service
 
 ### Added
