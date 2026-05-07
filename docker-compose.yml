@@ -521,6 +521,42 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ── Runbook seeder (one-shot, profile=seeding) ──────────────────────────────
+  # Reads markdown runbooks from ./data/runbooks, chunks + embeds them with
+  # sentence-transformers, and upserts into Postgres' runbook_chunks table.
+  # Excluded from `docker compose up` by default - invoke with:
+  #   docker compose --profile seeding up seed-runbooks
+  seed-runbooks:
+    profiles: ["seeding"]
+    build:
+      context: ./services/agent
+      dockerfile: Dockerfile
+    image: netobserv/agent:local
+    container_name: netobserv-seed-runbooks
+    # Override the image's default agent entrypoint to run the seeder instead.
+    entrypoint: ["python", "-m", "scripts.seed_runbooks"]
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      RUNBOOKS_DIR: /data/runbooks
+      CHUNK_MAX_TOKENS: ${CHUNK_MAX_TOKENS:-300}
+      CHUNK_OVERLAP_TOKENS: ${CHUNK_OVERLAP_TOKENS:-50}
+      LOG_LEVEL: ${LOG_LEVEL}
+    volumes:
+      - ./data/runbooks:/data/runbooks:ro
+      - ./scripts:/app/scripts:ro
+    networks:
+      - netobserv
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   # ── Grafana ───────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.2

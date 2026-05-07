@@ -1,32 +1,99 @@
 # Service: agent
 
-## Responsibility
+The AI brain of the platform. Phase 4.1 lands the **RAG knowledge-base
+layer**; Phase 4.2 will add the LangChain agent that turns anomaly events
+into Claude-generated runbooks.
 
-The AI brain of the platform. Subscribes to `network.anomalies`, retrieves relevant context from DynamoDB and pgvector, calls the Claude API to generate a remediation runbook, persists the runbook to MinIO and OpenSearch, and publishes a `network.runbooks` event.
+## Phase 4.1 surface (current)
 
-## Processing pipeline per anomaly event
+- **`services/agent/rag.py`** - public retrieval API the agent calls into.
+  Wraps pgvector cosine-distance queries against the `runbook_chunks`
+  table.
+  - `search_runbooks(query, k=5)` - top-k semantic search.
+  - `search_runbooks_filtered(query, anomaly_type, k=5)` - filtered by
+    `metadata.anomaly_type`.
+  - `get_full_runbook(source_file)` - returns the full markdown text
+    (disk first, Postgres reassembly as fallback) for the agent's
+    citation context.
+- **`services/agent/embeddings.py`** - cached `sentence-transformers`
+  loader; `embed_text` and `embed_batch` return float32 numpy arrays.
+- **`services/agent/chunking.py`** - paragraph-aware markdown chunker.
+  Strips YAML frontmatter, splits by `## Header`, joins paragraphs into
+  word-aligned chunks of `<= chunk_max_tokens` words with
+  `chunk_overlap_tokens` overlap.
+- **`services/agent/db.py`** - psycopg connection helpers (single-shot
+  `connect()` for the seeder, `psycopg_pool.ConnectionPool` for the
+  long-lived agent). Registers the pgvector adapter on every connection.
+- **`services/agent/config.py`** - pydantic-settings schema. Aliases
+  `EMBEDDING_MODEL_NAME`/`VECTOR_EMBEDDING_MODEL` and
+  `EMBEDDING_DIM`/`VECTOR_DIMENSIONS`.
+- **`scripts/seed_runbooks.py`** - one-shot ingestion script driven by
+  the same `Settings` class. Reads markdown from `data/runbooks/`,
+  chunks, embeds, upserts into `runbook_chunks`, and creates the
+  IVFFlat index post-load with `lists` tuned to the row count.
 
-1. **Topology context** — query DynamoDB for the affected node and its peers
-2. **RAG retrieval** — embed the anomaly description, query pgvector for top-k similar past runbooks
-3. **LLM call** — send Claude a structured prompt with anomaly details + retrieved runbooks as few-shot examples
-4. **Persist** — write the generated runbook Markdown to MinIO; index metadata in OpenSearch
-5. **Publish** — emit a `network.runbooks` event for the API to surface to the frontend
+## Knowledge base schema
 
-## Runbook output format
+`docker/postgres/init.sql` (Phase 2) and the seeder maintain:
 
-Claude produces structured Markdown with sections: **Summary**, **Root Cause Analysis**, **Immediate Mitigation Steps**, **Long-term Recommendations**, **Verification Commands**.
+```sql
+CREATE TABLE runbook_chunks (
+    id            UUID PRIMARY KEY,
+    source_file   TEXT NOT NULL,
+    section_title TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    embedding     vector(384) NOT NULL,
+    metadata      JSONB NOT NULL DEFAULT '{}',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_file, section_title, content)
+);
+```
 
-## Planned tech
+Embeddings are produced by `sentence-transformers/all-MiniLM-L6-v2`
+(384 dimensions). Switching models requires recreating the table with
+the new column type and re-running the seeder.
 
-- Python 3.11 + `anthropic` SDK + `langchain-community`
-- `pgvector` + `psycopg2` for vector similarity search
-- `boto3` for MinIO/S3 and DynamoDB reads
-- `aiokafka` consumer/producer
+## Phase 4.2 surface (planned)
+
+The same Phase 4.2 modules will sit alongside the Phase 4.1 code:
+
+- Subscribe to `anomalies.scored`, query `topology` for affected nodes,
+  call `search_runbooks_filtered(...)` for context, prompt Claude.
+- Persist the generated runbook to MinIO/S3 as Markdown.
+- Index runbook metadata in OpenSearch and publish an
+  `anomalies.runbooks` event for the API + frontend.
 
 ## Key env vars
 
-`ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `POSTGRES_HOST`, `AGENT_RAG_TOP_K`, `DYNAMODB_ENDPOINT_URL`, `S3_ENDPOINT_URL`
+```
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=netobserv
+POSTGRES_USER=netobserv
+POSTGRES_PASSWORD=changeme_local
+EMBEDDING_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
+EMBEDDING_DIM=384
+RAG_TOP_K=5
+RUNBOOKS_DIR=/data/runbooks
+```
 
-## Health check
+## Running the seeder locally
 
-`GET /health` → `{"status": "ok", "runbooks_generated": <count>, "last_generated": "<ts>"}`
+```bash
+docker compose --profile seeding up seed-runbooks
+# or, from the repo root with a venv:
+python -m scripts.seed_runbooks --runbooks-dir data/runbooks
+```
+
+## Tests
+
+```bash
+cd services/agent
+pip install -e ".[dev]"
+pytest -q
+```
+
+`test_chunking.py` runs in milliseconds (no torch, no Postgres).
+`test_embeddings.py` requires the model (cached in the Docker image).
+`test_rag.py` runs in pure-mock mode; set `RUN_RAG_INTEGRATION=1` to
+run the live Postgres + sentence-transformers integration check.

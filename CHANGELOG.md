@@ -5,6 +5,149 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 4.1] — 2026-05-04 — RAG Knowledge Base
+
+### Added
+
+- **data/runbooks/** — 10 hand-authored synthetic runbooks (300-600 words
+  each) covering the troubleshooting playbooks the agent will retrieve as
+  few-shot context: `bgp_flap_troubleshooting.md`, `route_leak_detection.md`,
+  `ddos_mitigation_cloud.md`, `high_latency_investigation.md`,
+  `packet_loss_diagnosis.md`, `asymmetric_routing.md`, `mtu_blackhole.md`,
+  `interface_utilization_capacity.md`, `dns_resolution_failures.md`,
+  `vpc_peering_connectivity.md`. Each runbook has YAML frontmatter
+  (`anomaly_type`, `severity`, `tags`) and the canonical sections
+  `Summary` / `Symptoms` / `Diagnostic Commands` / `Common Root Causes` /
+  `Remediation Steps` so the chunker maps cleanly to retrieval-time filters.
+
+- **services/agent/** — `netobserv-agent` Python 3.11 package providing the
+  Phase 4.1 RAG layer. Phase 4.2 will sit on top of these modules:
+  - **`chunking.py`** — paragraph-aware markdown chunker. Strips YAML
+    frontmatter, splits the body by `## Header`, then greedily joins
+    paragraphs into word-aligned chunks of `<= chunk_max_tokens` words with
+    `chunk_overlap_tokens` overlap. Pure-Python, dependency-free (PyYAML
+    is the only optional import), millisecond-fast unit tests. Oversized
+    paragraphs are split on word boundaries so the chunker never returns a
+    half-word.
+  - **`embeddings.py`** — cached `sentence-transformers` loader. Module-
+    level singleton with a thread lock so the model is loaded once per
+    process; `embed_text` / `embed_batch` return float32 numpy arrays.
+  - **`db.py`** — psycopg connection helpers: `connect()` for the seeder's
+    one-shot connection, `get_pool()` returning a process-level
+    `psycopg_pool.ConnectionPool` for the long-lived agent. The pgvector
+    adapter is registered on every connection (`register_vector`).
+  - **`rag.py`** — public retrieval API. Three functions:
+    - `search_runbooks(query, k=5)` — top-k semantic search using
+      pgvector's `<=>` cosine distance.
+    - `search_runbooks_filtered(query, anomaly_type, k=5)` — same plus a
+      `metadata->>'anomaly_type'` predicate, backed by the btree index on
+      that JSON path.
+    - `get_full_runbook(source_file)` — returns the original markdown text
+      from disk (`RUNBOOKS_DIR`) when present, otherwise reassembles the
+      runbook from `runbook_chunks` rows ordered by `metadata.chunk_index`.
+    All three return typed `RunbookChunk` dataclasses with both the cosine
+    `score` (1 - distance) and the raw `cosine_distance`.
+  - **`config.py`** — `pydantic-settings` schema covering Postgres
+    connection, embedding model + dim (with `EMBEDDING_MODEL_NAME` /
+    `VECTOR_EMBEDDING_MODEL` aliases), chunking knobs, RAG top-k, and the
+    Phase 4.2 Claude knobs so the same Settings class will serve the
+    agent without a refactor.
+  - **`Dockerfile`** — multi-stage `python:3.11-slim` build, non-root
+    `agent:10004` user, pre-downloads the embedding model into
+    `/opt/models` so the seed and Phase 4.2 agent images do not fetch
+    from Hugging Face at runtime. Default ENTRYPOINT is the long-running
+    agent; the Phase 4.1 seed compose service overrides this.
+  - **`tests/`** — pytest suite covering: (a) the chunker invariants
+    (frontmatter parsing, section splitting, no mid-word splits, overlap
+    correctness, oversized-paragraph splitting), (b) the embedding model
+    contract (384-dim, finite vectors, semantic similarity sanity check),
+    and (c) the rag layer behaviour with mocked psycopg (cosine operator
+    used, anomaly-type filter applied, score = 1 - distance, disk-first
+    `get_full_runbook` with Postgres fallback). An integration test gated
+    on `RUN_RAG_INTEGRATION=1` runs end-to-end against a live Postgres.
+
+- **scripts/seed_runbooks.py** — one-shot ingestion script. Discovers
+  every `*.md` under `RUNBOOKS_DIR`, chunks with the agent package's
+  chunker, batch-embeds with `sentence-transformers/all-MiniLM-L6-v2`,
+  validates that the model dimension matches `EMBEDDING_DIM` before any
+  writes, then UPSERTs into `runbook_chunks` keyed on
+  `(source_file, section_title, content)`. After load, drops and
+  recreates the IVFFlat cosine index with `lists` tuned to the row count
+  (`max(1, min(1024, sqrt(rows)))`) and runs `ANALYZE` so the planner
+  picks the index. CLI flags: `--runbooks-dir`, `--truncate`, `--no-index`,
+  `--dry-run`. Also creates `scripts/__init__.py` so
+  `python -m scripts.seed_runbooks` resolves both inside the container
+  and from the repo root.
+
+### Terraform
+
+- **terraform/rds.tf** — AWS counterpart to the local pgvector container.
+  - `aws_db_instance.pgvector` — Postgres 16.3, db.t3.micro by default
+    (override `rds_instance_class`), gp3 storage, encrypted at rest,
+    Performance Insights and Enhanced Monitoring (1-minute interval) on,
+    backup retention 7 days, deletion protection on, multi-AZ off (flip
+    for production), CloudWatch logs export for `postgresql` and
+    `upgrade`.
+  - `aws_db_parameter_group.pgvector` — custom `postgres16` family
+    parameter group preloading `pg_stat_statements,vector` via
+    `shared_preload_libraries`. pgvector is built-in from Postgres 15.2+
+    so `CREATE EXTENSION vector` after provisioning is the only manual
+    step (the `rds_pgvector_init_sql` output documents this).
+  - `aws_db_subnet_group.main` — created when `rds_subnet_ids` is
+    populated; needs ≥2 subnets across AZs.
+  - `aws_security_group.rds` — created when `rds_vpc_id` is populated;
+    ingress allows TCP 5432 only from `var.vpc_cidr` (no public exposure).
+  - `aws_secretsmanager_secret.rds_master` + version — stores the
+    randomly-generated 32-character master password and the connection
+    metadata (username, dbname). The instance ignores `password` drift
+    (managed via Secrets Manager rotation in production).
+  - `aws_iam_role.rds_monitoring` — attaches the AWS-managed
+    `AmazonRDSEnhancedMonitoringRole` policy.
+  - Outputs: `rds_endpoint`, `rds_address`, `rds_port`,
+    `rds_database_name`, `rds_master_secret_arn`,
+    `rds_security_group_id`, `rds_pgvector_init_sql`.
+
+### Changed
+
+- **docker/postgres/init.sql** — schema updated to match the Phase 4.1
+  contract. Replaces the placeholder `runbook_embeddings` table with
+  `runbook_chunks (id UUID, source_file TEXT, section_title TEXT,
+  content TEXT, embedding vector(384), metadata JSONB, created_at TIMESTAMPTZ)`.
+  The `vector(1536)` column is now `vector(384)` (all-MiniLM-L6-v2). Adds
+  the `uuid-ossp` extension, a uniqueness constraint on
+  `(source_file, section_title, content)` for idempotent re-seeding, and
+  cheap btree indexes on `metadata->>'anomaly_type'` and `source_file`.
+  The IVFFlat cosine index is no longer created here; the seed script
+  builds it post-load with row-count-tuned `lists` so cluster centroids
+  train against real data.
+
+- **docker-compose.yml** — adds `seed-runbooks` under the `seeding`
+  profile. Builds the agent image, overrides ENTRYPOINT to
+  `python -m scripts.seed_runbooks`, mounts `./data/runbooks` and
+  `./scripts` read-only, depends on `postgres` healthy. Excluded from
+  the default `docker compose up`; invoked with
+  `docker compose --profile seeding up seed-runbooks` (or `make seed`).
+
+- **Makefile** — `make seed` now drives the `seed-runbooks` compose
+  service via `docker compose --profile seeding up --build
+  --abort-on-container-exit`, replacing the orphaned `scripts` service
+  invocation. `make train` is updated to the equivalent `--profile
+  training` form for symmetry.
+
+- **.env.example** — replaces `VECTOR_EMBEDDING_MODEL=text-embedding-3-small`
+  / `VECTOR_DIMENSIONS=1536` (the OpenAI default carried over from Phase
+  1) with `EMBEDDING_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2`
+  and `EMBEDDING_DIM=384`. Adds `RUNBOOKS_DIR`, `CHUNK_MAX_TOKENS`,
+  `CHUNK_OVERLAP_TOKENS`, `RAG_TOP_K`. The Phase 4.2 placeholder
+  variables (`AGENT_MAX_TOKENS`, `AGENT_TEMPERATURE`,
+  `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`) are kept for the next phase.
+
+- **services/agent/README.md** — updated from a Phase 1 placeholder to
+  document the Phase 4.1 surface (`rag.py` API, schema, env vars, run
+  instructions, test layout).
+
+---
+
 ## [Phase 3.2] — 2026-04-30 — Real-Time Anomaly Detection Engine
 
 ### Added

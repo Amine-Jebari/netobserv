@@ -65,11 +65,11 @@ ps:
 # ══════════════════════════════════════════════════════════════════════════════
 .PHONY: seed
 seed:
-	$(COMPOSE) run --rm -e PYTHONPATH=/app scripts python /app/scripts/seed_runbooks.py
+	$(COMPOSE) --profile seeding up --build --abort-on-container-exit seed-runbooks
 
 .PHONY: train
 train:
-	$(COMPOSE) run --rm -e PYTHONPATH=/app scripts python /app/scripts/train_baseline.py
+	$(COMPOSE) --profile training up --build --abort-on-container-exit baseline
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Development
