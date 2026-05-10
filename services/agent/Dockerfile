@@ -68,14 +68,24 @@ RUN mkdir -p /app/services/agent /app/scripts /app/data/runbooks && \
     chown -R agent:agent /app
 
 # Agent package modules
-COPY --chown=agent:agent __init__.py    /app/services/agent/__init__.py
-COPY --chown=agent:agent config.py      /app/services/agent/config.py
-COPY --chown=agent:agent embeddings.py  /app/services/agent/embeddings.py
-COPY --chown=agent:agent chunking.py    /app/services/agent/chunking.py
-COPY --chown=agent:agent db.py          /app/services/agent/db.py
-COPY --chown=agent:agent rag.py         /app/services/agent/rag.py
+COPY --chown=agent:agent __init__.py              /app/services/agent/__init__.py
+COPY --chown=agent:agent __main__.py              /app/services/agent/__main__.py
+COPY --chown=agent:agent config.py                /app/services/agent/config.py
+COPY --chown=agent:agent logging_setup.py         /app/services/agent/logging_setup.py
+COPY --chown=agent:agent metrics.py               /app/services/agent/metrics.py
+COPY --chown=agent:agent embeddings.py            /app/services/agent/embeddings.py
+COPY --chown=agent:agent chunking.py              /app/services/agent/chunking.py
+COPY --chown=agent:agent db.py                    /app/services/agent/db.py
+COPY --chown=agent:agent rag.py                   /app/services/agent/rag.py
+COPY --chown=agent:agent investigations_store.py  /app/services/agent/investigations_store.py
+COPY --chown=agent:agent tools.py                 /app/services/agent/tools.py
+COPY --chown=agent:agent agent.py                 /app/services/agent/agent.py
+COPY --chown=agent:agent runbook.py               /app/services/agent/runbook.py
+COPY --chown=agent:agent main.py                  /app/services/agent/main.py
 
 USER agent
+
+EXPOSE 8080
 
 # Default to the long-running agent. The Phase 4.1 seed compose service
 # overrides this entrypoint to run ``scripts.seed_runbooks``.

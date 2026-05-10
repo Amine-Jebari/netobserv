@@ -521,6 +521,82 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ── Agent (LangChain Gemini investigator + RAG, Phase 4.2) ──────────────────
+  # Long-running service: consumes anomalies.scored, runs the LangChain
+  # function-calling loop against Google Gemini for WARN/CRITICAL events, and
+  # persists investigations + rendered runbooks to Postgres.
+  agent:
+    build:
+      context: ./services/agent
+      dockerfile: Dockerfile
+    image: netobserv/agent:local
+    container_name: netobserv-agent
+    environment:
+      # LLM (Google Gemini)
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      AGENT_MAX_TOKENS: ${AGENT_MAX_TOKENS:-4096}
+      AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.2}
+      MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-8}
+      INVESTIGATION_TIMEOUT_SECONDS: ${AGENT_INVESTIGATION_TIMEOUT_SECONDS:-120}
+      INVESTIGATE_SEVERITIES: ${AGENT_INVESTIGATE_SEVERITIES:-WARN,CRITICAL}
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC_ANOMALIES: ${KAFKA_TOPIC_ANOMALIES}
+      KAFKA_TOPIC_RUNBOOKS: ${KAFKA_TOPIC_RUNBOOKS}
+      KAFKA_CONSUMER_GROUP: ${AGENT_KAFKA_CONSUMER_GROUP:-netobserv-agent}
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-latest}
+      # Topology
+      TOPOLOGY_SERVICE_URL: ${TOPOLOGY_SERVICE_URL:-http://topology:8080}
+      # InfluxDB (get_metrics tool)
+      INFLUXDB_URL: ${INFLUXDB_URL}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      # OpenSearch (get_recent_events tool)
+      OPENSEARCH_URL: ${OPENSEARCH_HOST}
+      OPENSEARCH_USER: ${OPENSEARCH_USER:-}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-}
+      OPENSEARCH_BGP_INDEX_PATTERN: ${OPENSEARCH_BGP_INDEX_PATTERN:-bgp-events-*}
+      OPENSEARCH_ANOMALIES_INDEX_PATTERN: ${OPENSEARCH_ANOMALIES_INDEX_PATTERN:-anomalies-*}
+      # Postgres (RAG + investigations table)
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_POOL_SIZE: ${POSTGRES_POOL_SIZE:-5}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      # HTTP / observability
+      HTTP_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "8094:8080"   # host:container — keeps 8080-8093 free for other services
+    networks:
+      - netobserv
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      topology:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
   # ── Runbook seeder (one-shot, profile=seeding) ──────────────────────────────
   # Reads markdown runbooks from ./data/runbooks, chunks + embeds them with
   # sentence-transformers, and upserts into Postgres' runbook_chunks table.

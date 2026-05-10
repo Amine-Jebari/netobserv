@@ -5,6 +5,150 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Phase 4.2] — 2026-05-07 — AI Investigation Agent
+
+### Added
+
+- **services/agent/** — extended the Phase 4.1 RAG package into a long-running
+  investigation agent. The service consumes ``anomalies.scored`` from Kafka,
+  routes WARN/CRITICAL events into a bounded LangChain function-calling loop
+  against **Google Gemini** (``gemini-2.0-flash`` by default, swappable via
+  ``GEMINI_MODEL``), and persists each investigation's reasoning trace +
+  rendered runbook into a new Postgres ``investigations`` table for the
+  dashboard to render.
+  - **`tools.py`** — four LangChain ``StructuredTool`` adapters wired through
+    a shared ``Toolbox`` (httpx client + RAG closure):
+    - ``query_topology(node_id?, prefix?)`` — calls the topology service's
+      ``/topology/node/{id}`` or ``/topology/affected`` endpoints and
+      projects the verbose payload into a ≤20-node / ≤30-edge summary.
+    - ``get_metrics(target, metric, lookback_minutes=30)`` — runs a Flux
+      query against InfluxDB filtered against ``srcaddr|dstaddr|device_id|interface``
+      and returns up to 50 ``(ts, value)`` points (uniform-stride
+      downsampled when more are present). User-influenced strings are
+      ASCII-sanitized before interpolation into Flux.
+    - ``search_runbooks(query, k=3)`` — wraps the Phase 4.1 pgvector search
+      and returns top-3 chunks with stable ``filename.md#Section`` citation
+      handles the agent must echo in its verdict.
+    - ``get_recent_events(prefix?, node_id?, lookback_minutes=30)`` — last
+      20 BGP events / scored anomalies from OpenSearch; the bool query
+      ANDs a time range and ORs ``prefix == X`` / multi-match on
+      ``peer_ip|device_id|node_id|srcaddr|dstaddr``.
+  - **`agent.py`** — the bounded reasoning loop. Drives a
+    ``ChatGoogleGenerativeAI`` with the four tools bound for function-calling
+    and enforces:
+      * ``MAX_TOOL_CALLS`` (default 8) hard cap — once exceeded the loop
+        injects a "tool budget exhausted" ToolMessage and prompts for the
+        final verdict;
+      * ``INVESTIGATION_TIMEOUT_SECONDS`` (default 120) wall-clock cap;
+      * structured trace capture: every thought, tool call, tool result,
+        and final answer is appended as a ``TraceStep`` and persisted in
+        ``investigations.reasoning_trace`` (JSONB);
+      * token accounting via ``message.usage_metadata`` with both
+        the legacy ``response_metadata`` shape and the normalized
+        ``usage_metadata`` shape supported, exposed as the Prometheus
+        counter ``claude_tokens_used_total{type, model}`` (legacy name kept
+        intentionally for dashboard continuity);
+      * a strict system prompt with a 4-step protocol
+        (UNDERSTAND → HYPOTHESIZE → VERIFY → CONCLUDE), a citation-required
+        rule, and a fenced-JSON output contract that ``parse_verdict`` extracts.
+  - **`runbook.py`** — deterministic markdown renderer. Takes the verdict
+    + trace and emits a fixed-section runbook (Summary / Root cause /
+    Blast radius / Evidence / Remediation steps / Citations / Investigation
+    metadata). Uses a template instead of a second LLM call so output is
+    reproducible and there's no per-investigation cost doubling.
+  - **`investigations_store.py`** — Postgres CRUD for the ``investigations``
+    table. ``insert_started()`` is called before the loop runs so the row
+    exists for the duration of the investigation; ``update_completed()``
+    fills in the trace/verdict/runbook + token counts when done.
+  - **`metrics.py`** — Prometheus registry exposing
+    ``claude_tokens_used_total``, ``agent_investigations_started_total``,
+    ``agent_investigations_completed_total{outcome}``,
+    ``agent_tool_calls_total{tool, outcome}``,
+    ``agent_investigation_duration_seconds`` (histogram), and
+    ``agent_anomalies_consumed_total{severity, decision}``.
+  - **`main.py` / `__main__.py`** — service entry point. AIOKafkaConsumer
+    on ``anomalies.scored``, severity-based routing (INFO is logged but
+    not investigated; WARN/CRITICAL spawn an investigation off the loop
+    via ``run_in_executor``). The same module hosts the FastAPI app:
+      * ``GET /health`` — 200 once the consumer is connected, 503 otherwise;
+      * ``GET /metrics`` — Prometheus exposition;
+      * ``GET /investigations[?limit=&severity=]`` — recent investigations
+        in compact summary form (id, severity, root_cause/confidence
+        snippet);
+      * ``GET /investigations/{id}`` — full row including reasoning trace
+        and rendered runbook;
+      * ``POST /investigate`` — manually trigger an investigation on a
+        supplied anomaly event (replays from cache if a completed
+        investigation already exists for that anomaly_id — useful for
+        demos and debugging without re-spending LLM tokens).
+  - **`config.py`** — extended with the Phase 4.2 surface: ``GOOGLE_API_KEY``,
+    ``GEMINI_MODEL`` (``CLAUDE_MODEL`` kept as a legacy alias),
+    ``KAFKA_*`` consumer knobs, ``TOPOLOGY_SERVICE_URL``, ``INFLUXDB_*``,
+    ``OPENSEARCH_*`` patterns, and the agent-loop safety knobs
+    ``MAX_TOOL_CALLS`` / ``INVESTIGATION_TIMEOUT_SECONDS`` /
+    ``INVESTIGATE_SEVERITIES``.
+  - **`tests/`** — three new pytest modules:
+    - ``test_tools.py`` exercises each of the four tools using
+      ``httpx.MockTransport`` (no real backends) — happy path, missing
+      arguments, 4xx/5xx, and a sanitization test that confirms hostile
+      characters in tool arguments don't bleed into the Flux query;
+    - ``test_agent_loop.py`` plugs a ``ScriptedChatModel`` that emits a
+      pre-recorded sequence of ``AIMessage`` responses (tool call, then
+      fenced-JSON final). Validates trace shape, token accounting, the
+      tool-call budget, and the no-verdict error path;
+    - ``test_runbook.py`` covers the markdown renderer's section
+      structure, step renumbering, and the missing-verdict short-circuit.
+  - **`Dockerfile`** — extended to copy all new modules and expose 8080.
+    The pre-warmed ``sentence-transformers`` model from Phase 4.1 is
+    preserved so the agent's first ``search_runbooks`` call doesn't pay
+    the load latency.
+  - **`pyproject.toml`** — bumped to 0.2.0 and added ``langchain``,
+    ``langchain-core``, ``langchain-google-genai``, ``google-generativeai``,
+    ``fastapi``, ``uvicorn[standard]``, ``aiokafka``, ``httpx``, and
+    ``prometheus-client``.
+
+- **docker/postgres/init.sql** — new ``investigations`` table with btree
+  indexes on ``anomaly_id``, ``started_at DESC``, ``severity``, and
+  ``status``. JSONB columns for ``anomaly_event``, ``reasoning_trace``,
+  and ``verdict`` so the dashboard can render the trace without a JOIN.
+
+- **docker-compose.yml** — new ``agent`` service running the long-lived
+  investigator on port ``8094`` (host) → ``8080`` (container).
+  ``depends_on`` waits for redpanda, postgres, topology, influxdb, and
+  opensearch all healthy.
+
+- **.env.example** — replaced the ``ANTHROPIC_API_KEY`` / ``CLAUDE_MODEL``
+  block with ``GOOGLE_API_KEY`` / ``GEMINI_MODEL``, and added the agent
+  safety knobs (``AGENT_MAX_TOOL_CALLS``,
+  ``AGENT_INVESTIGATION_TIMEOUT_SECONDS``,
+  ``AGENT_INVESTIGATE_SEVERITIES``) plus the new OpenSearch index
+  patterns.
+
+- **terraform/outputs.tf** — new aggregate outputs for the agent's AWS
+  deployment: ``topology_service_url`` (variable, populated when the
+  topology Fargate service is provisioned in a later phase),
+  ``influxdb_endpoint`` (Timestream regional query endpoint),
+  ``influxdb_database``, plus the bundled ``agent_service_config`` map
+  the deployment pipeline can pass straight to the agent's task
+  definition / Helm chart. Per-resource outputs (``rds_endpoint``,
+  ``opensearch_endpoint``, etc.) keep their existing locations to avoid
+  declaration collisions.
+
+### Notes
+
+- **LLM provider**: this phase intentionally uses **Google Gemini** rather
+  than Anthropic Claude. The ``claude_tokens_used_total`` Prometheus metric
+  name is preserved so the platform's existing dashboards and the project's
+  cost-tracking spec keep working when providers swap. The original
+  scoping doc references Claude / Anthropic SDK; this implementation
+  satisfies the same contract via ``langchain-google-genai``.
+- **No new Terraform files** beyond ``outputs.tf`` (per the phase brief).
+  The agent's compute (ECS Fargate task definition) lands in a later phase
+  alongside the deployment pipeline; until then ``agent_service_config``
+  is the single integration point.
+
+---
+
 ## [Phase 4.1] — 2026-05-04 — RAG Knowledge Base
 
 ### Added
